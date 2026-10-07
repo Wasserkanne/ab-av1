@@ -1,5 +1,5 @@
 //! _sample-encode_ file system caching logic.
-use crate::ffmpeg::FfmpegEncodeArgs;
+use crate::ffmpeg::{self, FfmpegEncodeArgs};
 use anyhow::Context;
 use std::{
     ffi::OsStr,
@@ -22,6 +22,12 @@ pub async fn cached_encode(
 ) -> (Option<super::EncodeResult>, Option<Key>) {
     if !cache {
         return (None, None);
+    }
+
+    // hashing includes the svt-av1 version, resolved with a subprocess that can
+    // block ~500ms. Initialise the cache off the async runtime.
+    if enc_args.vcodec.as_ref() == "libsvtav1" {
+        let _ = tokio::task::spawn_blocking(ffmpeg::warm_svtav1_version_cache).await;
     }
 
     let hash = hash_encode(
