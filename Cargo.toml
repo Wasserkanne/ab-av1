@@ -42,7 +42,9 @@ tokio = { version = "1.15", features = [
     "macros",
     "process",
     "fs",
+    "io-util",
     "signal",
+    "sync",
 ] }
 tokio-process-stream = "0.4"
 tokio-stream = "0.1"
