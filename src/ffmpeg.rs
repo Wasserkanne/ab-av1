@@ -21,6 +21,20 @@ use tokio::process::Command;
 use tokio_process_stream::{Item, ProcessChunkStream};
 use tokio_stream::StreamExt;
 
+static SVT_AV1_V: LazyLock<String> = LazyLock::new(|| {
+    ffmpeg_svtav1_version()
+        .inspect_err(|e| debug!("read_ffmpeg_svtav1_version: {e}"))
+        .unwrap_or_default()
+});
+
+/// Resolve & cache the svt-av1 encoder version, used in sample-encode cache keys.
+///
+/// Blocks on a subprocess for up to ~500ms, so callers should run this via
+/// `tokio::task::spawn_blocking` rather than on the async runtime.
+pub fn warm_svtav1_version_cache() {
+    _ = &*SVT_AV1_V;
+}
+
 /// Exposed ffmpeg encoding args.
 #[derive(Debug, Clone)]
 pub struct FfmpegEncodeArgs<'a> {
@@ -37,12 +51,6 @@ pub struct FfmpegEncodeArgs<'a> {
 
 impl FfmpegEncodeArgs<'_> {
     pub fn sample_encode_hash(&self, state: &mut impl Hasher) {
-        static SVT_AV1_V: LazyLock<String> = LazyLock::new(|| {
-            ffmpeg_svtav1_version()
-                .inspect_err(|e| debug!("read_ffmpeg_svtav1_version: {e}"))
-                .unwrap_or_default()
-        });
-
         // hashing svt-av1 version means new encoder releases will avoid old cache data
         if &*self.vcodec == "libsvtav1" {
             SVT_AV1_V.hash(state);
