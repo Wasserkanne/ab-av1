@@ -1,463 +1,178 @@
-use crate::command::args::PixelFormat;
-use anyhow::Context;
-use clap::Parser;
-use std::{borrow::Cow, fmt::Display, sync::Arc, thread};
+//! Shared argument logic.
+mod encode;
+mod vmaf;
 
-const DEFAULT_VMAF_FPS: f32 = 25.0;
+pub use encode::*;
+pub use vmaf::*;
 
-/// Common vmaf options.
-#[derive(Debug, Parser, Clone)]
-pub struct Vmaf {
-    /// Set to calculate vmaf when it would otherwise not be, e.g. when calculating xpsnr.
-    /// So using this allows both vmaf & xpsnr to be calculated at the same time.
-    // TODO: nicer if named "--vmaf"
-    #[arg(long, num_args=0..=1, default_missing_value = "true")]
-    pub and_vmaf: Option<bool>,
+use crate::{command::encode::default_output_ext, ffprobe::Ffprobe};
+use clap::{Parser, ValueHint};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
-    /// Additional vmaf arg(s). E.g. --vmaf n_threads=8 --vmaf n_subsample=4
+/// Encoding args that apply when encoding to an output.
+#[derive(Parser, Clone)]
+pub struct EncodeToOutput {
+    /// Output file, by default the same as input with `.av1` before the extension.
     ///
-    /// By default `n_threads` is set to available system threads.
-    ///
-    /// Also see https://ffmpeg.org/ffmpeg-filters.html#libvmaf.
-    #[arg(long = "vmaf", value_parser = parse_vmaf_arg)]
-    pub vmaf_args: Vec<Arc<str>>,
+    /// E.g. if unspecified: -i vid.mkv --> vid.av1.mkv
+    #[arg(short, long, value_hint = ValueHint::FilePath)]
+    pub output: Option<PathBuf>,
 
-    /// Video resolution scale to use in VMAF analysis. If set, video streams will be bicubic
-    /// scaled to this during VMAF analysis. `auto` (default) automatically sets
-    /// based on the model and input video resolution. `none` disables any scaling.
-    /// `WxH` format may be used to specify custom scaling, e.g. `1920x1080`.
+    /// Set the output ffmpeg audio codec.
+    /// By default 'copy' is used. Otherwise, if re-encoding is necessary, 'libopus' is default.
     ///
-    /// auto behaviour:
-    /// * 1k model (default for resolutions <= 2560x1440) if width and height
-    ///   are less than 1728 & 972 respectively upscale to 1080p. Otherwise no scaling.
-    /// * 4k model (default for resolutions > 2560x1440) if width and height
-    ///   are less than 3456 & 1944 respectively upscale to 4k. Otherwise no scaling.
-    ///
-    /// The auto behaviour is based on the distorted video dimensions, equivalent
-    /// to post input/reference vfilter dimensions.
-    ///
-    /// Scaling happens after any input/reference vfilters.
-    #[arg(long, default_value_t, value_parser = parse_vmaf_scale)]
-    pub vmaf_scale: VmafScale,
+    /// See https://ffmpeg.org/ffmpeg.html#Audio-Options.
+    #[arg(long = "acodec")]
+    pub audio_codec: Option<String>,
 
+    /// Downmix input audio streams to stereo if input streams use greater than
+    /// 3 channels.
+    ///
+    /// No effect if the input audio has 3 or fewer channels.
+    #[arg(long)]
+    pub downmix_to_stereo: bool,
+
+    /// Only process the main video stream, drop all other streams.
+    ///
+    /// The output will be a single video stream.
+    #[arg(long)]
+    pub video_only: bool,
+
+    /// By default input files will not be overwritten to prevent accidental data loss.
+    /// Setting this option overrides that allowing input overwrites.
+    #[arg(long)]
+    pub overwrite_input: bool,
+
+    /// Verify the encoded result before moving it into place. Enables all
+    /// `--verify-*` checks. A failed check leaves no output file.
+    ///
+    /// Catches results that are damaged or cut short even though ffmpeg exited
+    /// successfully, e.g. from a truncated input.
+    #[arg(long)]
+    pub verify: bool,
+
+    /// Verify the encoded result decodes without errors. Costs an extra full decode.
+    #[arg(long)]
+    pub verify_decode: bool,
+
+    /// Verify the encoded result duration matches the input duration, within 2s.
+    ///
+    /// Skipped when the input has no duration, e.g. images.
+    /// Not suitable for encodes that intentionally change the duration,
+    /// e.g. trimming with --enc or --vfilter; use --verify-decode alone for those.
+    #[arg(long)]
+    pub verify_duration: bool,
+
+    /// Stop the encode as soon as ffmpeg reports an error, instead of finishing with
+    /// a damaged result. Maps to ffmpeg `-xerror`.
+    ///
+    /// Unlike --verify this needs no second pass and catches errors decoding the
+    /// input, which may leave no trace in the result. Applies to the final encode
+    /// only, not to sample encodes.
+    #[arg(long)]
+    pub fail_fast: bool,
+}
+
+/// Sampling arguments.
+#[derive(Parser, Clone)]
+pub struct Sample {
+    /// Number of samples to use across the input video. Overrides --sample-every.
+    /// More samples take longer but may provide a more accurate result.
+    #[arg(long)]
+    pub samples: Option<u64>,
+
+    /// Calculate number of samples by dividing the input duration by this value.
+    /// So "12m" would mean with an input 25-36 minutes long, 3 samples would be used.
+    /// More samples take longer but may provide a more accurate result.
+    ///
+    /// Setting --samples overrides this value.
+    #[arg(long, default_value = "12m", value_parser = humantime::parse_duration)]
+    pub sample_every: Duration,
+
+    /// Minimum number of samples. So at least this many samples will be used.
+    #[arg(long)]
+    pub min_samples: Option<u64>,
+
+    /// Duration of each sample.
+    #[arg(long, default_value = "20s", value_parser = humantime::parse_duration)]
+    pub sample_duration: Duration,
+
+    /// Keep temporary files after exiting.
+    #[arg(long)]
+    pub keep: bool,
+
+    /// Directory to store temporary sample data in.
+    /// Defaults to the current working directory.
+    #[arg(long, env = "AB_AV1_TEMP_DIR", value_hint = ValueHint::DirPath)]
+    pub temp_dir: Option<PathBuf>,
+
+    /// Extension preference for encoded samples.
+    #[arg(skip)]
+    pub extension: Option<Arc<str>>,
+}
+
+impl Sample {
+    /// Calculate the desired sample count using `samples` or `sample_every` & `min_samples`.
+    pub fn sample_count(&self, input_duration: Duration) -> u64 {
+        match self.samples {
+            Some(s) => s,
+            None => {
+                (input_duration.as_secs_f64() / self.sample_every.as_secs_f64().max(1.0)).ceil()
+                    as _
+            }
+        }
+        .max(self.min_samples.unwrap_or(1))
+        .max(1)
+    }
+
+    pub fn set_extension_from_input(&mut self, input: &Path, encoder: &Encoder, probe: &Ffprobe) {
+        self.extension = Some(default_output_ext(input, encoder, probe.is_image).into());
+    }
+
+    pub fn set_extension_from_output(&mut self, output: &Path) {
+        self.extension = output.extension().and_then(|e| e.to_str().map(Into::into));
+    }
+}
+
+/// Args for when VMAF/XPSNR are used to score ref vs distorted.
+#[derive(Debug, Parser, Clone, Hash)]
+pub struct ScoreArgs {
+    /// Ffmpeg video filter applied to the VMAF/XPSNR reference before analysis.
+    /// E.g. --reference-vfilter "scale=1280:-1,fps=24".
+    ///
+    /// Overrides --vfilter which would otherwise be used.
+    #[arg(long)]
+    pub reference_vfilter: Option<Arc<str>>,
+}
+
+/// Common xpsnr options.
+#[derive(Debug, Parser, Clone, Copy)]
+pub struct Xpsnr {
     /// Frame rate override used to analyse both reference & distorted videos.
     /// Maps to ffmpeg `-r` input arg.
     ///
     /// Setting to 0 disables use.
-    #[arg(long, default_value_t = DEFAULT_VMAF_FPS)]
-    pub vmaf_fps: f32,
+    #[arg(long, default_value_t = 60.0)]
+    pub xpsnr_fps: f32,
+
+    /// Pixel format used in xpsnr analysis only. By default this is inferred from sources.
+    #[arg(value_enum, long)]
+    pub xpsnr_pix_format: Option<PixelFormat>,
 }
 
-impl Default for Vmaf {
-    fn default() -> Self {
-        Self {
-            and_vmaf: None,
-            vmaf_args: <_>::default(),
-            vmaf_scale: <_>::default(),
-            vmaf_fps: DEFAULT_VMAF_FPS,
-        }
-    }
-}
-
-impl std::hash::Hash for Vmaf {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.and_vmaf.hash(state);
-        self.vmaf_args.hash(state);
-        self.vmaf_scale.hash(state);
-        self.vmaf_fps.to_ne_bytes().hash(state);
-    }
-}
-
-fn parse_vmaf_arg(arg: &str) -> anyhow::Result<Arc<str>> {
-    Ok(arg.to_owned().into())
-}
-
-impl Vmaf {
+impl Xpsnr {
     pub fn fps(&self) -> Option<f32> {
-        Some(self.vmaf_fps).filter(|r| *r > 0.0)
-    }
-
-    /// Returns ffmpeg `filter_complex`/`lavfi` value for calculating vmaf.
-    pub fn ffmpeg_lavfi(
-        &self,
-        distorted_res: Option<(u32, u32)>,
-        pix_fmt: Option<PixelFormat>,
-        ref_vfilter: Option<&str>,
-    ) -> String {
-        let mut args = self.vmaf_args.clone();
-        if !args.iter().any(|a| a.contains("n_threads")) {
-            // default n_threads to all cores
-            args.push(
-                format!(
-                    "n_threads={}",
-                    thread::available_parallelism().map_or(1, |p| p.get())
-                )
-                .into(),
-            );
-        }
-        let mut lavfi = args.join(":");
-        lavfi.insert_str(0, "libvmaf=shortest=true:ts_sync_mode=nearest:");
-
-        let mut model = VmafModel::from_args(&args);
-        if let (None, Some((w, h))) = (model, distorted_res)
-            && w > 2560
-            && h > 1440
-        {
-            // for >2k resolutions use 4k model
-            lavfi.push_str(":model=version=vmaf_4k_v0.6.1");
-            model = Some(VmafModel::V0_6_1_4k);
-        }
-
-        let ref_vf: Cow<_> = match ref_vfilter {
-            None => "".into(),
-            Some(vf) if vf.ends_with(',') => vf.into(),
-            Some(vf) => format!("{vf},").into(),
-        };
-        let format = pix_fmt.map(|v| format!("format={v},")).unwrap_or_default();
-        let scale = self
-            .vf_scale(model.unwrap_or_default(), distorted_res)
-            .map(|(w, h)| format!("scale={w}:{h}:flags=bicubic,"))
-            .unwrap_or_default();
-
-        // prefix:
-        // * Add reference-vfilter if any
-        // * convert both streams to common pixel format
-        // * scale to vmaf width if necessary
-        // * sync presentation timestamp
-        let prefix = format!(
-            "[0:v]{format}{scale}setpts=PTS-STARTPTS,settb=AVTB[dis];\
-             [1:v]{format}{ref_vf}{scale}setpts=PTS-STARTPTS,settb=AVTB[ref];\
-             [dis][ref]"
-        );
-
-        lavfi.insert_str(0, &prefix);
-        lavfi
-    }
-
-    fn vf_scale(&self, model: VmafModel, distorted_res: Option<(u32, u32)>) -> Option<(i32, i32)> {
-        match (self.vmaf_scale, distorted_res) {
-            (VmafScale::Auto, Some((w, h))) => match model {
-                m if m.wants_1080_scale() && w < 1728 && h < 972 => {
-                    Some(minimally_scale((w, h), (1920, 1080)))
-                }
-                m if m.wants_2160_scale() && w < 3456 && h < 1944 => {
-                    Some(minimally_scale((w, h), (3840, 2160)))
-                }
-                _ => None,
-            },
-            (VmafScale::Custom { width, height }, Some((w, h))) => {
-                Some(minimally_scale((w, h), (width, height)))
-            }
-            (VmafScale::Custom { width, height }, None) => Some((width as _, height as _)),
-            _ => None,
-        }
+        Some(self.xpsnr_fps).filter(|r| *r > 0.0)
     }
 }
 
-/// Return the smallest ffmpeg vf `(w, h)` scale values so that at least one of the
-/// `target_w` or `target_h` bounds are met.
-fn minimally_scale((from_w, from_h): (u32, u32), (target_w, target_h): (u32, u32)) -> (i32, i32) {
-    let w_factor = from_w as f64 / target_w as f64;
-    let h_factor = from_h as f64 / target_h as f64;
-    if h_factor > w_factor {
-        (-1, target_h as _) // scale vertically
-    } else {
-        (target_w as _, -1) // scale horizontally
+impl std::hash::Hash for Xpsnr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.xpsnr_fps.to_ne_bytes().hash(state);
+        self.xpsnr_pix_format.hash(state);
     }
-}
-
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VmafScale {
-    None,
-    #[default]
-    Auto,
-    Custom {
-        width: u32,
-        height: u32,
-    },
-}
-
-fn parse_vmaf_scale(vs: &str) -> anyhow::Result<VmafScale> {
-    const ERR: &str = "vmaf-scale must be 'none', 'auto' or WxH format e.g. '1920x1080'";
-    match vs {
-        "none" => Ok(VmafScale::None),
-        "auto" => Ok(VmafScale::Auto),
-        _ => {
-            let (w, h) = vs.split_once('x').context(ERR)?;
-            let (width, height) = (w.parse().context(ERR)?, h.parse().context(ERR)?);
-            Ok(VmafScale::Custom { width, height })
-        }
-    }
-}
-
-impl Display for VmafScale {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::None => "none".fmt(f),
-            Self::Auto => "auto".fmt(f),
-            Self::Custom { width, height } => write!(f, "{width}x{height}"),
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
-enum VmafModel {
-    /// Default 1080p model.
-    #[default]
-    V0_6_1,
-    /// 4k model.
-    V0_6_1_4k,
-    V1_0_16_3d0h,
-    V1_0_16_5d0h,
-    V1_0_16_1d5h4k,
-    V1_0_16_3d0h4k,
-    /// Some other user specified model.
-    Custom,
-}
-
-impl VmafModel {
-    fn from_args(args: &[Arc<str>]) -> Option<Self> {
-        let mut using_custom_model: Vec<_> = args.iter().filter(|v| v.contains("model")).collect();
-
-        match using_custom_model.len() {
-            0 => None,
-            1 => Some(match using_custom_model.remove(0) {
-                v if v.ends_with("version=vmaf_v0.6.1") => Self::V0_6_1,
-                v if v.ends_with("version=vmaf_4k_v0.6.1") => Self::V0_6_1_4k,
-                v if v.ends_with("version=vmaf_v1.0.16_3d0h") => Self::V1_0_16_3d0h,
-                v if v.ends_with("version=vmaf_v1.0.16_hfr_3d0h") => Self::V1_0_16_3d0h,
-                v if v.ends_with("version=vmaf_v1.0.16_5d0h") => Self::V1_0_16_5d0h,
-                v if v.ends_with("version=vmaf_v1.0.16_hfr_5d0h") => Self::V1_0_16_5d0h,
-                v if v.ends_with("version=vmaf_v1.0.16_1d5h_2160") => Self::V1_0_16_1d5h4k,
-                v if v.ends_with("version=vmaf_v1.0.16_hfr_1d5h_2160") => Self::V1_0_16_1d5h4k,
-                v if v.ends_with("version=vmaf_v1.0.16_3d0h_2160") => Self::V1_0_16_3d0h4k,
-                v if v.ends_with("version=vmaf_v1.0.16_hfr_3d0h_2160") => Self::V1_0_16_3d0h4k,
-                _ => Self::Custom,
-            }),
-            _ => Some(Self::Custom),
-        }
-    }
-
-    fn wants_1080_scale(self) -> bool {
-        matches!(self, Self::V0_6_1 | Self::V1_0_16_3d0h | Self::V1_0_16_5d0h)
-    }
-
-    fn wants_2160_scale(self) -> bool {
-        matches!(
-            self,
-            Self::V0_6_1_4k | Self::V1_0_16_1d5h4k | Self::V1_0_16_3d0h4k
-        )
-    }
-}
-
-#[test]
-fn vmaf_lavfi() {
-    let vmaf = Vmaf {
-        vmaf_args: vec!["n_threads=5".into(), "n_subsample=4".into()],
-        ..<_>::default()
-    };
-    assert_eq!(
-        vmaf.ffmpeg_lavfi(
-            None,
-            Some(PixelFormat::Yuv420p),
-            Some("scale=1280:-1,fps=24")
-        ),
-        "[0:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[dis];\
-         [1:v]format=yuv420p,scale=1280:-1,fps=24,setpts=PTS-STARTPTS,settb=AVTB[ref];\
-         [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:n_subsample=4"
-    );
-}
-
-#[test]
-fn vmaf_lavfi_default() {
-    let vmaf = Vmaf::default();
-    let expected = format!(
-        "[0:v]setpts=PTS-STARTPTS,settb=AVTB[dis];\
-         [1:v]setpts=PTS-STARTPTS,settb=AVTB[ref];\
-         [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads={}",
-        thread::available_parallelism().map_or(1, |p| p.get())
-    );
-    assert_eq!(vmaf.ffmpeg_lavfi(None, None, None), expected);
-}
-
-#[test]
-fn vmaf_lavfi_default_pix_fmt() {
-    let vmaf = Vmaf::default();
-    let expected = format!(
-        "[0:v]format=yuv420p10le,setpts=PTS-STARTPTS,settb=AVTB[dis];\
-         [1:v]format=yuv420p10le,setpts=PTS-STARTPTS,settb=AVTB[ref];\
-         [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads={}",
-        thread::available_parallelism().map_or(1, |p| p.get())
-    );
-    assert_eq!(
-        vmaf.ffmpeg_lavfi(None, Some(PixelFormat::Yuv420p10le), None),
-        expected
-    );
-}
-
-#[test]
-fn vmaf_lavfi_include_n_threads() {
-    let vmaf = Vmaf {
-        vmaf_args: vec!["log_path=output.xml".into()],
-        ..<_>::default()
-    };
-    let expected = format!(
-        "[0:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[dis];\
-         [1:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[ref];\
-         [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:log_path=output.xml:n_threads={}",
-        thread::available_parallelism().map_or(1, |p| p.get())
-    );
-    assert_eq!(
-        vmaf.ffmpeg_lavfi(None, Some(PixelFormat::Yuv420p), None),
-        expected
-    );
-}
-
-/// Low resolution videos should be upscaled to 1080p
-#[test]
-fn vmaf_lavfi_small_width_upscale_to_1k() {
-    let vmaf = Vmaf {
-        vmaf_args: vec!["n_threads=5".into(), "n_subsample=4".into()],
-        ..<_>::default()
-    };
-    assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((1280, 720)), Some(PixelFormat::Yuv420p), None),
-        "[0:v]format=yuv420p,scale=1920:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[dis];\
-         [1:v]format=yuv420p,scale=1920:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[ref];\
-         [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:n_subsample=4"
-    );
-}
-
-#[test]
-fn vmaf_lavfi_v1_0_16_small_width_upscale_to_1k() {
-    for v in [
-        "vmaf_v1.0.16_3d0h",
-        "vmaf_v1.0.16_hfr_3d0h",
-        "vmaf_v1.0.16_5d0h",
-        "vmaf_v1.0.16_hfr_5d0h",
-    ] {
-        let vmaf = Vmaf {
-            vmaf_args: vec!["n_threads=5".into(), format!("model=version={v}").into()],
-            ..<_>::default()
-        };
-        assert_eq!(
-            vmaf.ffmpeg_lavfi(Some((1280, 720)), Some(PixelFormat::Yuv420p), None),
-            format!(
-                "[0:v]format=yuv420p,scale=1920:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[dis];\
-                 [1:v]format=yuv420p,scale=1920:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[ref];\
-                 [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:model=version={v}"
-            ),
-            "{v}: {vmaf:#?}",
-        );
-    }
-}
-
-/// 4k videos should use 4k model
-#[test]
-fn vmaf_lavfi_4k() {
-    let vmaf = Vmaf {
-        vmaf_args: vec!["n_threads=5".into(), "n_subsample=4".into()],
-        ..<_>::default()
-    };
-    assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((3840, 2160)), Some(PixelFormat::Yuv420p), None),
-        "[0:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[dis];\
-         [1:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[ref];\
-         [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:n_subsample=4:model=version=vmaf_4k_v0.6.1"
-    );
-}
-
-/// >2k videos should be upscaled to 4k & use 4k model
-#[test]
-fn vmaf_lavfi_3k_upscale_to_4k() {
-    let vmaf = Vmaf {
-        vmaf_args: vec!["n_threads=5".into()],
-        ..<_>::default()
-    };
-    assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((3008, 1692)), Some(PixelFormat::Yuv420p), None),
-        "[0:v]format=yuv420p,scale=3840:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[dis];\
-         [1:v]format=yuv420p,scale=3840:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[ref];\
-         [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:model=version=vmaf_4k_v0.6.1"
-    );
-}
-
-#[test]
-fn vmaf_lavfi_v1_0_16_3k_upscale_to_4k() {
-    for v in [
-        "vmaf_v1.0.16_1d5h_2160",
-        "vmaf_v1.0.16_hfr_1d5h_2160",
-        "vmaf_v1.0.16_3d0h_2160",
-        "vmaf_v1.0.16_hfr_3d0h_2160",
-    ] {
-        let vmaf = Vmaf {
-            vmaf_args: vec!["n_threads=5".into(), format!("model=version={v}").into()],
-            ..<_>::default()
-        };
-        assert_eq!(
-            vmaf.ffmpeg_lavfi(Some((3008, 1692)), Some(PixelFormat::Yuv420p), None),
-            format!(
-                "[0:v]format=yuv420p,scale=3840:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[dis];\
-                 [1:v]format=yuv420p,scale=3840:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[ref];\
-                 [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:model=version={v}"
-            ),
-            "{v}: {vmaf:#?}",
-        );
-    }
-}
-
-/// If user has overridden the model, don't default a vmaf width
-#[test]
-fn vmaf_lavfi_small_width_custom_model() {
-    let vmaf = Vmaf {
-        vmaf_args: vec![
-            "model=version=foo".into(),
-            "n_threads=5".into(),
-            "n_subsample=4".into(),
-        ],
-        ..<_>::default()
-    };
-    assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((1280, 720)), Some(PixelFormat::Yuv420p), None),
-        "[0:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[dis];\
-         [1:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[ref];\
-         [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:model=version=foo:n_threads=5:n_subsample=4"
-    );
-}
-
-#[test]
-fn vmaf_lavfi_custom_model_and_width() {
-    let vmaf = Vmaf {
-        vmaf_args: vec![
-            "model=version=foo".into(),
-            "n_threads=5".into(),
-            "n_subsample=4".into(),
-        ],
-        // if specified just do it
-        vmaf_scale: VmafScale::Custom {
-            width: 123,
-            height: 720,
-        },
-        ..<_>::default()
-    };
-    assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((1280, 720)), Some(PixelFormat::Yuv420p), None),
-        "[0:v]format=yuv420p,scale=123:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[dis];\
-         [1:v]format=yuv420p,scale=123:-1:flags=bicubic,setpts=PTS-STARTPTS,settb=AVTB[ref];\
-         [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:model=version=foo:n_threads=5:n_subsample=4"
-    );
-}
-
-#[test]
-fn vmaf_lavfi_1080p() {
-    let vmaf = Vmaf {
-        vmaf_args: vec!["n_threads=5".into(), "n_subsample=4".into()],
-        ..<_>::default()
-    };
-    assert_eq!(
-        vmaf.ffmpeg_lavfi(Some((1920, 1080)), Some(PixelFormat::Yuv420p), None),
-        "[0:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[dis];\
-         [1:v]format=yuv420p,setpts=PTS-STARTPTS,settb=AVTB[ref];\
-         [dis][ref]libvmaf=shortest=true:ts_sync_mode=nearest:n_threads=5:n_subsample=4"
-    );
 }
