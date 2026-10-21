@@ -201,7 +201,11 @@ pub async fn run(
 
     // print output info
     let output_size = fs::metadata(&output).await?.len();
-    let output_percent = 100.0 * output_size as f64 / fs::metadata(&args.input).await?.len() as f64;
+    let input_size = fs::metadata(&args.input).await?.len();
+    let output_percent = match input_size {
+        0 => 0.0,
+        n => 100.0 * output_size as f64 / n as f64,
+    };
     let output_size = style(HumanBytes(output_size)).dim().bold();
     let output_percent = style!("{}%", output_percent.round()).dim().bold();
     eprint!(

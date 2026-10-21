@@ -85,7 +85,12 @@ pub async fn cache_result(key: Key, result: &super::EncodeResult) -> anyhow::Res
 fn open_db() -> sled::Result<sled::Db> {
     const LOCK_MAX_WAIT: Duration = Duration::from_secs(2);
 
-    let mut path = dirs::cache_dir().expect("no cache dir found");
+    let mut path = dirs::cache_dir().ok_or_else(|| {
+        sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no cache dir found",
+        ))
+    })?;
     path.push("ab-av1");
     path.push("sample-encode-cache");
     let a = Instant::now();

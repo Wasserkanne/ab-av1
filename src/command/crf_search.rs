@@ -5,7 +5,7 @@ pub use err::Error;
 use crate::{
     command::{
         PROGRESS_CHARS, args,
-        sample_encode::{self, StdoutFormat, Work},
+        sample_encode::{self, ScoreKind, StdoutFormat, Work},
     },
     console_ext::style,
     ffprobe::{self, Ffprobe},
@@ -216,7 +216,7 @@ pub async fn crf_search(
             } => {
                 if verbose
                     .log_level()
-                    .is_some_and(|lvl| lvl > log::Level::Error)
+                    .is_some_and(|lvl| lvl >= log::Level::Error)
                 {
                     result.print_attempt(&bar, sample, Some(crf))
                 }
@@ -276,6 +276,13 @@ pub fn run(
         Error::ensure_other(min_crf < max_crf, "Invalid --min-crf & --max-crf")?;
         // by default use vmaf 95, otherwise use whatever is specified
         let min_score = min_vmaf.or(min_xpsnr).unwrap_or(DEFAULT_MIN_VMAF);
+        // which score the search is based on. Note both vmaf & xpsnr may be
+        // calculated (--and-vmaf) but only the requested one may be compared.
+        let score_kind = if min_xpsnr.is_some() && min_vmaf.is_none() {
+            ScoreKind::Xpsnr
+        } else {
+            ScoreKind::Vmaf
+        };
 
         // Whether to make the 2nd iteration on the ~20%/~80% crf point instead of the min/max to
         // improve interpolation by narrowing the crf range a 20% (or 30%) subrange.
@@ -296,8 +303,7 @@ pub fn run(
             high_crf_means_hq: high_crf_means_hq.unwrap_or_else(|| args.encoder.high_crf_means_hq()),
         };
 
-        let (min_q, max_q) = q_conv.min_max_q(min_crf, max_crf);
-        assert!(min_q < max_q);
+        let (min_q, max_q) = q_bounds(&q_conv, min_crf, max_crf)?;
         let mut q = (min_q + max_q) / 2;
 
         let mut args = sample_encode::Args {
@@ -342,8 +348,9 @@ pub fn run(
                 crf: args.crf,
                 q,
                 enc: sample_enc_output.context("no sample output?")?,
+                kind: score_kind,
             };
-            let score = sample.enc.single_score();
+            let score = sample.score();
             crf_attempts.push(sample.clone());
             yield Update::SampleEncodeDone(sample.clone());
             let sample_small_enough = sample.enc.encode_percent <= max_encoded_percent as _;
@@ -366,7 +373,9 @@ pub fn run(
                         return;
                     }
                     Some(upper) => {
-                        q = vmaf_lerp_q(min_score, upper, &sample);
+                        // fall back to a plain bisection if the scores aren't monotonic
+                        q = vmaf_lerp_q(min_score, upper, &sample)
+                            .unwrap_or((upper.q + sample.q) / 2);
                     }
                     None if sample.q == max_q => {
                         Error::ensure_or_no_good_crf(sample_small_enough, &sample)?;
@@ -397,7 +406,9 @@ pub fn run(
                         return;
                     }
                     Some(lower) => {
-                        q = vmaf_lerp_q(min_score, &sample, lower);
+                        // fall back to a plain bisection if the scores aren't monotonic
+                        q = vmaf_lerp_q(min_score, &sample, lower)
+                            .unwrap_or((sample.q + lower.q) / 2);
                     }
                     None if cut_on_iter2 && run == 1 && sample.q > min_q + 1 => {
                         q = (sample.q as f32 * 0.4 + min_q as f32 * 0.6).round() as _;
@@ -416,16 +427,28 @@ pub struct Sample {
     pub enc: sample_encode::Output,
     pub crf: f32,
     q: i64,
+    /// Score kind the search is based on.
+    kind: ScoreKind,
 }
 
 impl Sample {
+    /// The score the search is based on.
+    pub fn score(&self) -> f32 {
+        self.enc.score_of(self.kind).unwrap_or_default()
+    }
+
+    /// The score kind the search is based on.
+    pub fn score_kind(&self) -> ScoreKind {
+        self.kind
+    }
+
     pub fn print_attempt(&self, bar: &ProgressBar, min_score: f32, max_encoded_percent: f32) {
         if bar.is_hidden() {
             info!(
                 "crf {} {} {:.2} ({:.0}%){}",
                 TerseF32(self.crf),
-                self.enc.single_score_kind(),
-                self.enc.single_score(),
+                self.kind,
+                self.score(),
                 self.enc.encode_percent,
                 if self.enc.from_cache { " (cache)" } else { "" }
             );
@@ -435,9 +458,9 @@ impl Sample {
         let crf_label = style("- crf").dim();
         let mut crf = style(TerseF32(self.crf));
 
-        let score_v = self.enc.single_score();
+        let score_v = self.score();
         let mut score = style(score_v);
-        let score_label = style(self.enc.single_score_kind()).dim();
+        let score_label = style(self.kind).dim();
         let mut percent = style!("{:.0}%", self.enc.encode_percent);
         let open = style("(").dim();
         let close = style(")").dim();
@@ -463,8 +486,8 @@ impl Sample {
     pub fn print_result_human(&self, image: bool) {
         let crf = style(TerseF32(self.crf)).bold().green();
         let enc = &self.enc;
-        let score = style(enc.single_score()).bold().green();
-        let score_kind = enc.single_score_kind();
+        let score = style(self.score()).bold().green();
+        let score_kind = self.kind;
         let size = style(HumanBytes(enc.predicted_encode_size)).bold().green();
         let percent = style!("{}%", enc.encode_percent.round()).bold().green();
         let time = style(HumanDuration(enc.predicted_encode_time)).bold();
@@ -506,6 +529,7 @@ fn test_sample() -> Sample {
         },
         crf: 34.0,
         q: 34,
+        kind: ScoreKind::Vmaf,
     }
 }
 
@@ -545,20 +569,23 @@ fn parse_stdout_format() {
 /// though it seems to work better than a binary search.
 /// Perhaps a better approximation of a general crf->vmaf model could be found.
 /// This would be helpful particularly for small crf-increments.
-fn vmaf_lerp_q(min_vmaf: f32, worse_q: &Sample, better_q: &Sample) -> i64 {
-    assert!(
-        worse_q.enc.single_score() <= min_vmaf
-            && worse_q.enc.single_score() < better_q.enc.single_score()
-            && worse_q.q > better_q.q,
-        "invalid vmaf_lerp_crf usage: ({min_vmaf}, {worse_q:?}, {better_q:?})"
-    );
+fn vmaf_lerp_q(min_vmaf: f32, worse_q: &Sample, better_q: &Sample) -> Option<i64> {
+    let worse_score = worse_q.score();
+    let better_score = better_q.score();
+    if !(worse_score <= min_vmaf
+        && worse_score < better_score
+        && worse_q.q > better_q.q)
+    {
+        // not monotonic, can't interpolate
+        return None;
+    }
 
-    let vmaf_diff = better_q.enc.single_score() - worse_q.enc.single_score();
-    let vmaf_factor = (min_vmaf - worse_q.enc.single_score()) / vmaf_diff;
+    let vmaf_diff = better_score - worse_score;
+    let vmaf_factor = (min_vmaf - worse_score) / vmaf_diff;
 
     let q_diff = worse_q.q - better_q.q;
     let lerp = (worse_q.q as f32 - q_diff as f32 * vmaf_factor).round() as i64;
-    lerp.clamp(better_q.q + 1, worse_q.q - 1)
+    Some(lerp.clamp(better_q.q + 1, worse_q.q - 1))
 }
 
 /// sample_progress: [0, 1]
@@ -618,6 +645,63 @@ impl QualityConverter {
             false => (self.q(min_crf), self.q(max_crf)),
         }
     }
+}
+
+/// Non-monotonic crf->vmaf data (very possible with sample based scoring)
+/// must not panic the search.
+#[test]
+fn vmaf_lerp_q_non_monotonic_does_not_panic() {
+    let mk = |vmaf: f32, q: i64| Sample {
+        enc: sample_encode::Output {
+            vmaf_score: Some(vmaf),
+            xpsnr_score: None,
+            predicted_encode_size: 1,
+            encode_percent: 1.0,
+            predicted_encode_time: Duration::from_secs(1),
+            from_cache: false,
+        },
+        crf: q as f32,
+        q,
+        kind: ScoreKind::Vmaf,
+    };
+    // "worse" q that actually scored *better* than min_vmaf
+    let worse = mk(97.0, 48);
+    let better = mk(96.0, 30);
+
+    assert!(
+        vmaf_lerp_q(95.0, &worse, &better).is_none(),
+        "non-monotonic crf->vmaf data must not be interpolated"
+    );
+}
+
+/// Calculate the "q" bounds of a crf range, erroring if the range is invalid
+/// or too small to be searched.
+fn q_bounds(
+    q_conv: &QualityConverter,
+    min_crf: f32,
+    max_crf: f32,
+) -> Result<(i64, i64), Error> {
+    let (min_q, max_q) = q_conv.min_max_q(min_crf, max_crf);
+    Error::ensure_other(
+        min_q < max_q,
+        "Invalid --min-crf & --max-crf: range too small for the crf increment",
+    )?;
+    Ok((min_q, max_q))
+}
+
+/// A crf range that is valid but collapses to a single "q" step must be
+/// reported as an error, not panic.
+#[test]
+fn narrow_crf_range_is_an_error_not_a_panic() {
+    let q_conv = QualityConverter {
+        crf_increment: 1.0,
+        high_crf_means_hq: false,
+    };
+    let res = q_bounds(&q_conv, 30.0, 30.2);
+    assert!(
+        res.is_err(),
+        "a crf range that collapses to a single q step must be an error"
+    );
 }
 
 #[test]
