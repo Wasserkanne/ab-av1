@@ -12,7 +12,6 @@ use std::{
     task::{Context, Poll, ready},
     time::Duration,
 };
-use time::macros::format_description;
 use tokio::process::Child;
 use tokio_process_stream::{Item, ProcessChunkStream};
 use tokio_stream::Stream;
@@ -80,19 +79,18 @@ impl FfmpegOut {
         if line.starts_with("frame=") {
             let frame: u64 = parse_label_substr("frame=", line)?.parse().ok()?;
             let fps: f32 = parse_label_substr("fps=", line)?.parse().ok()?;
-            let (h, m, s, ns) = time::Time::parse(
-                parse_label_substr("time=", line)?,
-                &format_description!("[hour]:[minute]:[second].[subsecond]"),
-            )
-            .ok()?
-            .as_hms_nano();
-            return Some(Self::Progress {
-                frame,
-                fps,
-                time: Duration::new(h as u64 * 60 * 60 + m as u64 * 60 + s as u64, ns),
-            });
+            let time = parse_ffmpeg_time(parse_label_substr("time=", line)?)?;
+            return Some(Self::Progress { frame, fps, time });
         }
-        if line.starts_with("video:") && line.contains("muxing overhead") {
+        Self::try_parse_sizes(line)
+    }
+
+    /// Parse the stream size summary line, e.g.
+    /// "[out#0/null @ 0x1] video:224KiB audio:96KiB ... muxing overhead: 0.1%".
+    pub fn try_parse_sizes(line: &str) -> Option<Self> {
+        // note: ffmpeg prefixes the line, e.g.
+        // "[out#0/null @ 0x55d1b4] video:224KiB audio:0KiB ... muxing overhead: unknown"
+        if line.contains("video:") && line.contains("muxing overhead") {
             let video = parse_label_size("video:", line)?;
             let audio = parse_label_size("audio:", line)?;
             let subtitle = parse_label_size("subtitle:", line)?;
@@ -113,8 +111,45 @@ impl FfmpegOut {
             chunks: <_>::default(),
             name,
             cmd_str,
+            sizes_found: false,
         }
     }
+}
+
+/// Parse a ffmpeg `time=HH:MM:SS.ss` value.
+///
+/// The hour may have more than 2 digits for very long videos.
+fn parse_ffmpeg_time(time: &str) -> Option<Duration> {
+    let mut parts = time.split(':');
+    let hours: u64 = parts.next()?.parse().ok()?;
+    let minutes: u64 = parts.next()?.parse().ok()?;
+    let seconds_str = parts.next()?;
+    if parts.next().is_some() {
+        return None; // too many parts
+    }
+
+    let (seconds_str, fraction) = match seconds_str.split_once('.') {
+        Some((s, f)) => (s, f),
+        None => (seconds_str, ""),
+    };
+    let seconds: u64 = seconds_str.parse().ok()?;
+
+    let nanos = if fraction.is_empty() {
+        0
+    } else {
+        let digits: String = fraction.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() || digits.len() > 9 {
+            return None;
+        }
+        let val: u64 = digits.parse().ok()?;
+        let scale = 10u64.checked_pow(digits.len() as u32)?;
+        val.checked_mul(1_000_000_000)?.checked_div(scale)?
+    };
+
+    Some(Duration::new(
+        hours.checked_mul(3600)? + minutes.checked_mul(60)? + seconds,
+        nanos as u32,
+    ))
 }
 
 /// Parse a ffmpeg `label=  value ` type substring.
@@ -133,8 +168,24 @@ fn parse_label_substr<'a>(label: &str, line: &'a str) -> Option<&'a str> {
 
 fn parse_label_size(label: &str, line: &str) -> Option<u64> {
     let size = parse_label_substr(label, line)?;
-    let kbs: u64 = size.strip_suffix("kB")?.parse().ok()?;
-    Some(kbs * 1024)
+    // ffmpeg <7 printed "1234kB" (already divided by 1024),
+    // ffmpeg >=7 prints "1234KiB"/"12MiB"/"1GiB".
+    let (num, mult) = if let Some(n) = size.strip_suffix("KiB") {
+        (n, 1024u64)
+    } else if let Some(n) = size.strip_suffix("MiB") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = size.strip_suffix("GiB") {
+        (n, 1024 * 1024 * 1024)
+    } else if let Some(n) = size.strip_suffix("kB") {
+        (n, 1024)
+    } else if let Some(n) = size.strip_suffix("MB") {
+        (n, 1000 * 1000)
+    } else {
+        let n = size.strip_suffix("B")?;
+        (n, 1)
+    };
+    let v: u64 = num.parse().ok()?;
+    v.checked_mul(mult)
 }
 
 /// Output chunk storage.
@@ -233,6 +284,8 @@ pin_project_lite::pin_project! {
         name: &'static str,
         cmd_str: String,
         chunks: Chunks,
+        // set once the stream size summary line has been seen
+        sizes_found: bool,
     }
 }
 
@@ -254,6 +307,14 @@ impl Stream for FfmpegOutStream {
                 Some(item) => match item {
                     Item::Stderr(chunk) => {
                         self.chunks.push(&chunk);
+                        // the stream size summary is followed by more output so
+                        // it may not be the last line, search the whole buffer.
+                        if !self.sizes_found
+                            && let Some(out) = self.chunks.rfind_line_map(FfmpegOut::try_parse_sizes)
+                        {
+                            self.sizes_found = true;
+                            return Poll::Ready(Some(Ok(out)));
+                        }
                         if let Some(out) = FfmpegOut::try_parse(self.chunks.last_line()) {
                             return Poll::Ready(Some(Ok(out)));
                         }

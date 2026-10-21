@@ -206,7 +206,10 @@ impl Encode {
         let mut svtav1_params = vec![];
         if svtav1 {
             let scd = match (self.scd, self.keyint, keyint) {
-                (Some(true), ..) | (_, None, Some(_)) => 1,
+                // an explicit --scd true/false always wins
+                (Some(scd), ..) => scd as i32,
+                // default on when using the default keyint & the input is over 3m
+                (None, None, Some(_)) => 1,
                 _ => 0,
             };
             svtav1_params.push(format!("scd={scd}"));
@@ -725,6 +728,46 @@ fn svtav1_to_ffmpeg_args_default_under_3m() {
         .as_str();
     assert_eq!(svtargs, "scd=0:crf=32");
     assert!(input_args.is_empty());
+}
+
+/// An explicit `--scd false` must not be overridden by the ">3m input" default.
+#[test]
+fn scd_false_is_respected() {
+    let enc = Encode {
+        encoder: Encoder("libsvtav1".into()),
+        input: "vid.mp4".into(),
+        vfilter: None,
+        preset: None,
+        pix_format: None,
+        keyint: None,
+        scd: Some(false),
+        svt_args: vec![],
+        enc_args: vec![],
+        enc_input_args: vec![],
+    };
+
+    let probe = Ffprobe {
+        duration: Ok(Duration::from_secs(300)),
+        has_audio: true,
+        max_audio_channels: None,
+        fps: Ok(30.0),
+        resolution: Some((1280, 720)),
+        is_image: false,
+        pix_fmt: None,
+    };
+
+    let FfmpegEncodeArgs { output_args, .. } = enc
+        .to_ffmpeg_args(32.0, &probe, "mkv")
+        .expect("to_ffmpeg_args");
+    let idx = output_args
+        .iter()
+        .position(|a| a.as_str() == "-svtav1-params")
+        .expect("missing -svtav1-params");
+    let params = output_args[idx + 1].as_str();
+    assert!(
+        params.contains("scd=0"),
+        "expected scd=0 (user passed --scd false) in {params}"
+    );
 }
 
 #[test]

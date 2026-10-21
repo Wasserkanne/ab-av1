@@ -46,7 +46,7 @@ pub async fn clean_all() {
 
     for file in files {
         match file.is_dir() {
-            true => _ = tokio::fs::remove_dir(file).await,
+            true => _ = tokio::fs::remove_dir_all(file).await,
             false => _ = tokio::fs::remove_file(file).await,
         }
     }
@@ -64,7 +64,7 @@ async fn clean_non_keepables() {
 
     for file in matching {
         match file.is_dir() {
-            true => _ = tokio::fs::remove_dir(&file).await,
+            true => _ = tokio::fs::remove_dir_all(&file).await,
             false => _ = tokio::fs::remove_file(&file).await,
         }
         TEMPS.lock().unwrap().remove(&file);
