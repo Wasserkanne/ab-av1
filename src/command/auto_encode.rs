@@ -94,15 +94,15 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
                             .template(SPINNER_FINISHED)?
                             .progress_chars(PROGRESS_CHARS),
                     );
-                    let mut vmaf = style(last.enc.single_score());
-                    if last.enc.single_score() < min_score {
+                    let mut vmaf = style(last.score());
+                    if last.score() < min_score {
                         vmaf = vmaf.red();
                     }
                     let mut percent = style!("{:.0}%", last.enc.encode_percent);
                     if last.enc.encode_percent > max_encoded_percent as _ {
                         percent = percent.red();
                     }
-                    let score_kind = last.enc.single_score_kind();
+                    let score_kind = last.score_kind();
                     bar.finish_with_message(format!("{score_kind} {vmaf:.2}, size {percent}"));
                 }
                 bar.finish();
@@ -141,7 +141,7 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
             }) => {
                 if verbose
                     .log_level()
-                    .is_some_and(|lvl| lvl > log::Level::Warn)
+                    .is_some_and(|lvl| lvl >= log::Level::Warn)
                 {
                     result.print_attempt(&bar, sample, Some(crf))
                 }
@@ -150,7 +150,7 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
             Ok(crf_search::Update::RunResult(result)) => {
                 if verbose
                     .log_level()
-                    .is_some_and(|lvl| lvl > log::Level::Error)
+                    .is_some_and(|lvl| lvl >= log::Level::Error)
                 {
                     result.print_attempt(&bar, min_score, max_encoded_percent)
                 }

@@ -51,7 +51,7 @@ pub fn probe(input: &Path) -> Ffprobe {
                 has_audio: true,
                 max_audio_channels: None,
                 resolution: None,
-                is_image: false,
+                is_image,
                 pix_fmt: None,
             };
         }

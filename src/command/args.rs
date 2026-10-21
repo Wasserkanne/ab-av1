@@ -173,5 +173,36 @@ impl Xpsnr {
 impl std::hash::Hash for Xpsnr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.xpsnr_fps.to_ne_bytes().hash(state);
+        self.xpsnr_pix_format.hash(state);
     }
+}
+
+/// The xpsnr options take part in the sample-encode cache key, so a change of
+/// any of them must change the hash.
+#[test]
+fn xpsnr_hash_covers_all_options() {
+    use std::hash::Hasher;
+    fn hash(x: &Xpsnr) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(x, &mut h);
+        h.finish()
+    }
+    let base = Xpsnr {
+        xpsnr_fps: 60.0,
+        xpsnr_pix_format: Some(PixelFormat::Yuv420p),
+    };
+    let other_pix = Xpsnr {
+        xpsnr_fps: 60.0,
+        xpsnr_pix_format: Some(PixelFormat::Yuv420p10le),
+    };
+    let other_fps = Xpsnr {
+        xpsnr_fps: 30.0,
+        xpsnr_pix_format: Some(PixelFormat::Yuv420p),
+    };
+    assert_ne!(
+        hash(&base),
+        hash(&other_pix),
+        "xpsnr_pix_format is not part of the hash"
+    );
+    assert_ne!(hash(&base), hash(&other_fps), "xpsnr_fps is not part of the hash");
 }

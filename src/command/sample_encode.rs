@@ -248,7 +248,7 @@ pub fn run(
                 input_len,
                 full_pass,
                 &enc_args,
-                (&score, &vmaf, &xpsnr),
+                (&score, &vmaf, &xpsnr, &xpsnr_opts),
             )
             .await
             {
@@ -519,22 +519,26 @@ impl EncodeResult {
             from_cache,
             ..
         } = self;
-        bar.println(
-            style!(
-                "- {}Sample {sample_n} ({:.0}%){}{}{}",
-                crf.map(|crf| format!("crf {crf}: ")).unwrap_or_default(),
-                100.0 * *encoded_size as f32 / *sample_size as f32,
-                vmaf_score
-                    .map(|s| format!(" VMAF {s:.2}"))
-                    .unwrap_or_default(),
-                xpsnr_score
-                    .map(|s| format!(" XPSNR {s:.2}"))
-                    .unwrap_or_default(),
-                if *from_cache { " (cache)" } else { "" },
-            )
-            .dim()
-            .to_string(),
-        );
+        let msg = style!(
+            "- {}Sample {sample_n} ({:.0}%){}{}{}",
+            crf.map(|crf| format!("crf {crf}: ")).unwrap_or_default(),
+            100.0 * *encoded_size as f32 / *sample_size as f32,
+            vmaf_score
+                .map(|s| format!(" VMAF {s:.2}"))
+                .unwrap_or_default(),
+            xpsnr_score
+                .map(|s| format!(" XPSNR {s:.2}"))
+                .unwrap_or_default(),
+            if *from_cache { " (cache)" } else { "" },
+        )
+        .dim()
+        .to_string();
+        if bar.is_hidden() {
+            // the bar is not drawn (e.g. non-tty), println would be discarded
+            info!("{msg}");
+        } else {
+            bar.println(msg);
+        }
     }
 
     pub fn log_attempt(&self, sample_n: u64, samples: u64, crf: f32) {
@@ -618,15 +622,19 @@ impl EncodeResults for Vec<EncodeResult> {
     }
 
     fn mean_vmaf_score(&self) -> Option<f32> {
-        let mut scores = self.iter().filter_map(|r| r.vmaf_score).peekable();
-        scores.peek()?;
-        Some(scores.sum::<f32>() / self.len() as f32)
+        let scores: Vec<f32> = self.iter().filter_map(|r| r.vmaf_score).collect();
+        if scores.is_empty() {
+            return None;
+        }
+        Some(scores.iter().sum::<f32>() / scores.len() as f32)
     }
 
     fn mean_xpsnr_score(&self) -> Option<f32> {
-        let mut scores = self.iter().filter_map(|r| r.xpsnr_score).peekable();
-        scores.peek()?;
-        Some(scores.sum::<f32>() / self.len() as f32)
+        let scores: Vec<f32> = self.iter().filter_map(|r| r.xpsnr_score).collect();
+        if scores.is_empty() {
+            return None;
+        }
+        Some(scores.iter().sum::<f32>() / scores.len() as f32)
     }
 
     fn estimate_encode_size_by_duration(
@@ -771,6 +779,14 @@ impl Output {
         self.vmaf_score.or(self.xpsnr_score).unwrap_or_default()
     }
 
+    /// Extract the score of the given kind, if it was calculated.
+    pub fn score_of(&self, kind: ScoreKind) -> Option<f32> {
+        match kind {
+            ScoreKind::Vmaf => self.vmaf_score,
+            ScoreKind::Xpsnr => self.xpsnr_score,
+        }
+    }
+
     /// Extract vmaf or xpsnr kind. Use when it is expected to have only 1 of these.
     pub fn single_score_kind(&self) -> ScoreKind {
         match self.vmaf_score {
@@ -797,6 +813,26 @@ impl Output {
         }
         json
     }
+}
+
+/// The mean score must only average the samples that actually have a score.
+#[test]
+fn mean_score_ignores_samples_without_score() {
+    let mk = |vmaf: Option<f32>| EncodeResult {
+        sample_size: 100,
+        encoded_size: 50,
+        vmaf_score: vmaf,
+        xpsnr_score: None,
+        encode_time: Duration::from_secs(1),
+        sample_duration: Duration::from_secs(1),
+        from_cache: false,
+    };
+    let results = vec![mk(Some(90.0)), mk(None)];
+    assert_eq!(
+        results.mean_vmaf_score(),
+        Some(90.0),
+        "mean must average only the samples that have a score"
+    );
 }
 
 #[test]
