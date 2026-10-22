@@ -310,7 +310,8 @@ impl Stream for FfmpegOutStream {
                         // the stream size summary is followed by more output so
                         // it may not be the last line, search the whole buffer.
                         if !self.sizes_found
-                            && let Some(out) = self.chunks.rfind_line_map(FfmpegOut::try_parse_sizes)
+                            && let Some(out) =
+                                self.chunks.rfind_line_map(FfmpegOut::try_parse_sizes)
                         {
                             self.sizes_found = true;
                             return Poll::Ready(Some(Ok(out)));
@@ -370,6 +371,20 @@ fn parse_ffmpeg_progress_na_time() {
     assert_eq!(FfmpegOut::try_parse(out), None);
 }
 
+/// ffmpeg prints 2+ digit hours for long videos.
+#[test]
+fn parse_ffmpeg_progress_100h() {
+    let out = "frame=  288 fps= 94 q=-0.0 size=N/A time=100:00:00.00 bitrate=N/A speed=3.94x    \r";
+    assert_eq!(
+        FfmpegOut::try_parse(out),
+        Some(FfmpegOut::Progress {
+            frame: 288,
+            fps: 94.0,
+            time: Duration::new(100 * 3600, 0),
+        })
+    );
+}
+
 #[test]
 fn parse_ffmpeg_stream_sizes() {
     let out = "video:2897022kB audio:537162kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: 0.289700%\n";
@@ -378,6 +393,37 @@ fn parse_ffmpeg_stream_sizes() {
         Some(FfmpegOut::StreamSizes {
             video: 2897022 * 1024,
             audio: 537162 * 1024,
+            subtitle: 0,
+            other: 0,
+        })
+    );
+}
+
+/// ffmpeg >= 7.0 prints stream sizes with binary (KiB/MiB) units, not "kB".
+/// Real output captured from ffmpeg n8.1.3.
+#[test]
+fn parse_ffmpeg_stream_sizes_kib() {
+    let out = "video:21KiB audio:0KiB subtitle:0KiB other streams:0KiB global headers:0kB muxing overhead: unknown\n";
+    assert_eq!(
+        FfmpegOut::try_parse(out),
+        Some(FfmpegOut::StreamSizes {
+            video: 21 * 1024,
+            audio: 0,
+            subtitle: 0,
+            other: 0,
+        })
+    );
+}
+
+/// The real ffmpeg output line is prefixed with the muxer name.
+#[test]
+fn parse_ffmpeg_stream_sizes_prefixed() {
+    let out = "[out#0/null @ 0000018f597dbac0] video:224KiB audio:96KiB subtitle:0KiB other streams:0KiB global headers:0kB muxing overhead: unknown\n";
+    assert_eq!(
+        FfmpegOut::try_parse(out),
+        Some(FfmpegOut::StreamSizes {
+            video: 224 * 1024,
+            audio: 96 * 1024,
             subtitle: 0,
             other: 0,
         })

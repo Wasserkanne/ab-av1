@@ -204,5 +204,9 @@ fn xpsnr_hash_covers_all_options() {
         hash(&other_pix),
         "xpsnr_pix_format is not part of the hash"
     );
-    assert_ne!(hash(&base), hash(&other_fps), "xpsnr_fps is not part of the hash");
+    assert_ne!(
+        hash(&base),
+        hash(&other_fps),
+        "xpsnr_fps is not part of the hash"
+    );
 }

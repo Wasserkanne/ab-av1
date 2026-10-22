@@ -564,6 +564,9 @@ fn parse_stdout_format() {
 /// Note: `worse_q` will be a numerically higher q value (worse quality),
 ///       `better_q` a numerically lower q value (better quality).
 ///
+/// Returns `None` if the given samples don't allow a sensible interpolation,
+/// e.g. because the crf->score relation isn't monotonic.
+///
 /// # Issues
 /// Crf values do not linearly map to VMAF changes (or anything?) so this is a flawed method,
 /// though it seems to work better than a binary search.
@@ -572,10 +575,7 @@ fn parse_stdout_format() {
 fn vmaf_lerp_q(min_vmaf: f32, worse_q: &Sample, better_q: &Sample) -> Option<i64> {
     let worse_score = worse_q.score();
     let better_score = better_q.score();
-    if !(worse_score <= min_vmaf
-        && worse_score < better_score
-        && worse_q.q > better_q.q)
-    {
+    if !(worse_score <= min_vmaf && worse_score < better_score && worse_q.q > better_q.q) {
         // not monotonic, can't interpolate
         return None;
     }
@@ -676,11 +676,7 @@ fn vmaf_lerp_q_non_monotonic_does_not_panic() {
 
 /// Calculate the "q" bounds of a crf range, erroring if the range is invalid
 /// or too small to be searched.
-fn q_bounds(
-    q_conv: &QualityConverter,
-    min_crf: f32,
-    max_crf: f32,
-) -> Result<(i64, i64), Error> {
+fn q_bounds(q_conv: &QualityConverter, min_crf: f32, max_crf: f32) -> Result<(i64, i64), Error> {
     let (min_q, max_q) = q_conv.min_max_q(min_crf, max_crf);
     Error::ensure_other(
         min_q < max_q,
